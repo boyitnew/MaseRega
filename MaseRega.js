@@ -1,0 +1,1 @@
+let maseRega = "test";
