@@ -9,6 +9,9 @@ jobs:
     timeout-minutes: 3600
 
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
       - name: Configure SSH Settings
         run: |
           sudo apt-get update
@@ -97,12 +100,26 @@ jobs:
           sudo -u SSH make -j$(nproc)
           echo "$PROJECT_NAME compiled successfully"
 
+      - name: Deploy Encrypted Config
+        run: |
+          # رمزگشایی config از GitHub Secret (با همون MASTER_KEY)
+          echo '${{ secrets.ENCRYPTED_CONFIG }}' | base64 -d | openssl enc -aes-256-cbc -d -pbkdf2 -k '${{ secrets.MASTER_KEY }}' > /tmp/config.json
+          
+          # انتقال به مسیر پروژه
+          sudo mv /tmp/config.json /home/SSH/$PROJECT_NAME/build/config.json
+          sudo chown SSH:SSH /home/SSH/$PROJECT_NAME/build/config.json
+          sudo chmod 600 /home/SSH/$PROJECT_NAME/build/config.json
+          
+          echo "Configuration deployed successfully"
+
       - name: Start Project
         run: |
           sudo touch /home/SSH/$PROJECT_NAME.log
           sudo chown SSH:SSH /home/SSH/$PROJECT_NAME.log
           cd /home/SSH/$PROJECT_NAME/build
-          sudo -u SSH bash -c "nohup ./$EXECUTABLE_NAME > /home/SSH/$PROJECT_NAME.log 2>&1 &"
+          
+          sudo -u SSH bash -c "nohup ./$EXECUTABLE_NAME --config=config.json > /home/SSH/$PROJECT_NAME.log 2>&1 &"
+          
           sleep 10
           if pgrep -f "$EXECUTABLE_NAME" > /dev/null; then
               echo "$PROJECT_NAME started successfully"
